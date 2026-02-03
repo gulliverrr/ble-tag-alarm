@@ -10,6 +10,7 @@
 #include "esp_gap_ble_api.h"
 #include "esp_bt_main.h"
 #include "esp_timer.h"
+#include "driver/gpio.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 
@@ -19,6 +20,13 @@ static const char *TAG = "BLE_SCANNER";
 #define MAX_REGISTERED 5
 #define UART_NUM UART_NUM_0
 #define BUF_SIZE 256
+
+// GPIO Configuration - TODO: Adjust pins based on your hardware
+#define GPIO_INPUT_PIN     GPIO_NUM_34  // Input sensor/switch
+#define GPIO_RELAY_PIN     GPIO_NUM_26  // Relay control output
+#define RGB_LED_RED_PIN    GPIO_NUM_25  // RGB LED Red channel
+#define RGB_LED_GREEN_PIN  GPIO_NUM_27  // RGB LED Green channel
+#define RGB_LED_BLUE_PIN   GPIO_NUM_32  // RGB LED Blue channel
 
 typedef struct {
     int id;
@@ -39,6 +47,19 @@ static int next_id = 1;  // Start from 1
 // Registered devices (FIFO, max 5)
 static int registered_ids[MAX_REGISTERED];
 static int registered_count = 0;
+
+// Hardware status
+static bool gpio_input_state = false;
+static bool relay_state = false;
+
+// RGB LED color definitions
+typedef enum {
+    LED_OFF,
+    LED_GREEN,    // All tags online
+    LED_ORANGE,   // Some tags warning
+    LED_RED,      // Tags offline or critical
+    LED_BLUE      // Scanning/init
+} led_color_t;
 
 // Find or add device in the list
 static int find_or_add_device(uint8_t *addr) {
@@ -124,6 +145,110 @@ static void deregister_device(int id) {
         }
     }
     printf("Device ID %d is not registered.\n", id);
+}
+
+
+// Initialize GPIO and RGB LED
+static void init_gpio(void) {
+    // Configure input GPIO
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << GPIO_INPUT_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    
+    // Configure relay output
+    io_conf.pin_bit_mask = (1ULL << GPIO_RELAY_PIN);
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&io_conf);
+    gpio_set_level(GPIO_RELAY_PIN, 0);  // Relay off initially
+    
+    // Configure RGB LED pins
+    io_conf.pin_bit_mask = (1ULL << RGB_LED_RED_PIN) | 
+                           (1ULL << RGB_LED_GREEN_PIN) | 
+                           (1ULL << RGB_LED_BLUE_PIN);
+    gpio_config(&io_conf);
+    
+    ESP_LOGI(TAG, "GPIO initialized - Input: %d, Relay: %d, RGB: R%d G%d B%d",
+             GPIO_INPUT_PIN, GPIO_RELAY_PIN, 
+             RGB_LED_RED_PIN, RGB_LED_GREEN_PIN, RGB_LED_BLUE_PIN);
+}
+
+// Set RGB LED color
+static void set_led_color(led_color_t color) {
+    switch (color) {
+        case LED_OFF:
+            gpio_set_level(RGB_LED_RED_PIN, 0);
+            gpio_set_level(RGB_LED_GREEN_PIN, 0);
+            gpio_set_level(RGB_LED_BLUE_PIN, 0);
+            break;
+        case LED_GREEN:
+            gpio_set_level(RGB_LED_RED_PIN, 0);
+            gpio_set_level(RGB_LED_GREEN_PIN, 1);
+            gpio_set_level(RGB_LED_BLUE_PIN, 0);
+            break;
+        case LED_ORANGE:
+            gpio_set_level(RGB_LED_RED_PIN, 1);
+            gpio_set_level(RGB_LED_GREEN_PIN, 1);  // Red + Green = Orange
+            gpio_set_level(RGB_LED_BLUE_PIN, 0);
+            break;
+        case LED_RED:
+            gpio_set_level(RGB_LED_RED_PIN, 1);
+            gpio_set_level(RGB_LED_GREEN_PIN, 0);
+            gpio_set_level(RGB_LED_BLUE_PIN, 0);
+            break;
+        case LED_BLUE:
+            gpio_set_level(RGB_LED_RED_PIN, 0);
+            gpio_set_level(RGB_LED_GREEN_PIN, 0);
+            gpio_set_level(RGB_LED_BLUE_PIN, 1);
+            break;
+    }
+}
+
+// Update relay based on registered tag status
+static void update_relay(void) {
+    // TODO: Implement relay logic based on tag presence
+    // Example: Turn relay ON if any registered tag is online
+    int online_count = 0;
+    int64_t now = esp_timer_get_time() / 1000;
+    
+    for (int i = 0; i < registered_count; i++) {
+        for (int j = 0; j < device_count; j++) {
+            if (devices[j].id == registered_ids[i]) {
+                int64_t elapsed = now - devices[j].last_seen;
+                if (elapsed < 5000) {  // Online if seen in last 5 seconds
+                    online_count++;
+                }
+                break;
+            }
+        }
+    }
+    
+    bool should_activate = (online_count > 0);
+    if (should_activate != relay_state) {
+        relay_state = should_activate;
+        gpio_set_level(GPIO_RELAY_PIN, relay_state ? 1 : 0);
+        ESP_LOGI(TAG, "Relay %s (online tags: %d/%d)", 
+                 relay_state ? "ON" : "OFF", online_count, registered_count);
+    }
+}
+
+// Monitor GPIO input task
+static void gpio_monitor_task(void *param) {
+    while (1) {
+        bool current_state = gpio_get_level(GPIO_INPUT_PIN);
+        if (current_state != gpio_input_state) {
+            gpio_input_state = current_state;
+            ESP_LOGI(TAG, "GPIO Input changed: %s", 
+                     gpio_input_state ? "HIGH" : "LOW");
+            // TODO: Add logic based on input state change
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));  // Check every 100ms
+    }
 }
 
 // GAP callback
@@ -315,6 +440,33 @@ static void print_devices_task(void *param) {
         printf("-------------------------------------------------------------------------\n");
         printf("Registered devices online: %d/%d | Type ID+ENTER to register/deregister\n", active_count, registered_count);
         printf("=========================================================================\n\n");
+
+        // Update LED color based on registered device status
+        if (registered_count == 0) {
+            set_led_color(LED_BLUE);  // No devices registered
+        } else {
+            int online = 0, warning = 0, offline = 0;
+            int64_t now_led = esp_timer_get_time() / 1000;
+            
+            for (int i = 0; i < registered_count; i++) {
+                for (int j = 0; j < device_count; j++) {
+                    if (devices[j].id == registered_ids[i]) {
+                        int64_t elapsed = now_led - devices[j].last_seen;
+                        if (elapsed < 5000) online++;
+                        else if (elapsed < 30000) warning++;
+                        else offline++;
+                        break;
+                    }
+                }
+            }
+            
+            if (offline > 0) set_led_color(LED_RED);
+            else if (warning > 0) set_led_color(LED_ORANGE);
+            else set_led_color(LED_GREEN);
+        }
+        
+        // Update relay
+        update_relay();
     }
 }
 
@@ -431,9 +583,15 @@ void app_main(void) {
     uart_param_config(UART_NUM, &uart_config);
     uart_driver_install(UART_NUM, BUF_SIZE * 2, 0, 0, NULL, 0);
 
+    
+    // Initialize GPIO and start monitoring
+    init_gpio();
+    set_led_color(LED_BLUE);  // Blue during initialization
+
     // Start tasks
     xTaskCreate(print_devices_task, "print_devices", 4096, NULL, 5, NULL);
     xTaskCreate(console_input_task, "console_input", 4096, NULL, 5, NULL);
+    xTaskCreate(gpio_monitor_task, "gpio_monitor", 2048, NULL, 5, NULL);
 
     // Main loop
     while (1) {
