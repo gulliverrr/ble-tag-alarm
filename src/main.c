@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_bt.h"
 #include "esp_gap_ble_api.h"
 #include "esp_bt_main.h"
@@ -16,17 +17,26 @@
 
 static const char *TAG = "BLE_SCANNER";
 
+#define NVS_NAMESPACE "ble_alarm"
+#define NVS_REGISTERED_KEY "reg_devices"
+
 #define MAX_DEVICES 50
 #define MAX_REGISTERED 5
 #define UART_NUM UART_NUM_0
 #define BUF_SIZE 256
 
 // GPIO Configuration - TODO: Adjust pins based on your hardware
-#define GPIO_INPUT_PIN     GPIO_NUM_34  // Input sensor/switch
-#define GPIO_RELAY_PIN     GPIO_NUM_26  // Relay control output
+#define GPIO_PRESENCE_PIN  GPIO_NUM_34  // Cable presence pin (12V->0V when disconnected)
+#define GPIO_CHARGER_RELAY GPIO_NUM_26  // Charger 220V AC relay control
+#define GPIO_ALARM_RELAY   GPIO_NUM_33  // Alarm relay control
 #define RGB_LED_RED_PIN    GPIO_NUM_25  // RGB LED Red channel
 #define RGB_LED_GREEN_PIN  GPIO_NUM_27  // RGB LED Green channel
 #define RGB_LED_BLUE_PIN   GPIO_NUM_32  // RGB LED Blue channel
+
+// Timing constants
+#define TAG_PRESENT_THRESHOLD_MS     60000              // Tag considered present if seen in last 60s
+#define TAG_RECENT_THRESHOLD_MS      (10 * 60 * 1000)  // Tag recently present if seen in last 10 min
+#define TAG_ONLINE_THRESHOLD_MS      5000               // Tag considered online if seen in last 5s
 
 typedef struct {
     int id;
@@ -44,22 +54,108 @@ static ble_device_t devices[MAX_DEVICES];
 static int device_count = 0;
 static int next_id = 1;  // Start from 1
 
-// Registered devices (FIFO, max 5)
-static int registered_ids[MAX_REGISTERED];
+// Registered devices (FIFO, max 5) - store MAC addresses
+typedef struct {
+    uint8_t addr[6];
+} registered_device_t;
+
+static registered_device_t registered_macs[MAX_REGISTERED];
 static int registered_count = 0;
 
 // Hardware status
-static bool gpio_input_state = false;
-static bool relay_state = false;
+static bool cable_connected = false;
+static bool charger_relay_state = false;
+static bool alarm_relay_state = false;
+static int64_t last_tag_seen_time = 0;  // Last time any registered tag was seen
 
-// RGB LED color definitions
+// System states and RGB LED colors
+typedef enum {
+    STATE_CHARGING_TAG_PRESENT,    // Charging + tag present (<60s) - GREEN LED
+    STATE_CHARGING_TAG_RECENT,     // Charging + tag recent (60s-10min) - ORANGE LED
+    STATE_CHARGING_ALARM_ARMED,    // Charging + no tag (>10min) - RED LED
+    STATE_NOT_CHARGING             // Cable disconnected - BLUE LED
+} system_state_t;
+
 typedef enum {
     LED_OFF,
-    LED_GREEN,    // All tags online
-    LED_ORANGE,   // Some tags warning
-    LED_RED,      // Tags offline or critical
-    LED_BLUE      // Scanning/init
+    LED_GREEN,    // Charging, tag present
+    LED_ORANGE,   // Charging, tag recent
+    LED_RED,      // Charging, alarm armed
+    LED_BLUE      // Not charging
 } led_color_t;
+
+static system_state_t current_state = STATE_CHARGING_TAG_PRESENT;
+
+// Save registered devices to NVS
+static void save_registered_to_nvs(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error opening NVS: %s", esp_err_to_name(err));
+        return;
+    }
+
+    // Save count
+    err = nvs_set_i32(nvs_handle, "reg_count", registered_count);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error saving count: %s", esp_err_to_name(err));
+    }
+
+    // Save array of MAC addresses
+    if (registered_count > 0) {
+        err = nvs_set_blob(nvs_handle, NVS_REGISTERED_KEY, registered_macs,
+                          registered_count * sizeof(registered_device_t));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Error saving MACs: %s", esp_err_to_name(err));
+        }
+    }
+
+    nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "Saved %d registered devices to NVS", registered_count);
+    for (int i = 0; i < registered_count; i++) {
+        ESP_LOGI(TAG, "  - MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                 registered_macs[i].addr[0], registered_macs[i].addr[1],
+                 registered_macs[i].addr[2], registered_macs[i].addr[3],
+                 registered_macs[i].addr[4], registered_macs[i].addr[5]);
+    }
+}
+
+// Load registered devices from NVS
+static void load_registered_from_nvs(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "No saved devices found (first boot)");
+        return;
+    }
+
+    // Load count
+    int32_t count = 0;
+    err = nvs_get_i32(nvs_handle, "reg_count", &count);
+    if (err != ESP_OK || count <= 0) {
+        nvs_close(nvs_handle);
+        return;
+    }
+
+    // Load array of MAC addresses
+    size_t required_size = count * sizeof(registered_device_t);
+    err = nvs_get_blob(nvs_handle, NVS_REGISTERED_KEY, registered_macs, &required_size);
+    if (err == ESP_OK) {
+        registered_count = count;
+        ESP_LOGI(TAG, "Loaded %d registered devices from NVS", registered_count);
+        for (int i = 0; i < registered_count; i++) {
+            ESP_LOGI(TAG, "  - MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                     registered_macs[i].addr[0], registered_macs[i].addr[1],
+                     registered_macs[i].addr[2], registered_macs[i].addr[3],
+                     registered_macs[i].addr[4], registered_macs[i].addr[5]);
+        }
+    } else {
+        ESP_LOGE(TAG, "Error loading MACs: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(nvs_handle);
+}
 
 // Find or add device in the list
 static int find_or_add_device(uint8_t *addr) {
@@ -85,11 +181,22 @@ static int find_or_add_device(uint8_t *addr) {
     return -1;
 }
 
-// Check if device is registered
-static bool is_registered(int id) {
+// Check if device MAC is registered
+static bool is_registered_mac(uint8_t *addr) {
     for (int i = 0; i < registered_count; i++) {
-        if (registered_ids[i] == id) {
+        if (memcmp(registered_macs[i].addr, addr, 6) == 0) {
             return true;
+        }
+    }
+    return false;
+}
+
+// Check if device ID is registered (for display purposes)
+static bool is_registered(int id) {
+    // Find device by ID and check its MAC
+    for (int i = 0; i < device_count; i++) {
+        if (devices[i].id == id) {
+            return is_registered_mac(devices[i].addr);
         }
     }
     return false;
@@ -97,23 +204,23 @@ static bool is_registered(int id) {
 
 // Register a device by ID (FIFO)
 static void register_device(int id) {
-    // Check if already registered
-    if (is_registered(id)) {
-        printf("Device ID %d is already registered.\n", id);
-        return;
-    }
-
-    // Check if ID exists
-    bool found = false;
+    // Find device by ID
+    int device_idx = -1;
     for (int i = 0; i < device_count; i++) {
         if (devices[i].id == id) {
-            found = true;
+            device_idx = i;
             break;
         }
     }
 
-    if (!found) {
+    if (device_idx == -1) {
         printf("Device ID %d not found.\n", id);
+        return;
+    }
+
+    // Check if already registered
+    if (is_registered_mac(devices[device_idx].addr)) {
+        printf("Device ID %d is already registered.\n", id);
         return;
     }
 
@@ -121,26 +228,48 @@ static void register_device(int id) {
     if (registered_count >= MAX_REGISTERED) {
         // Shift left
         for (int i = 0; i < MAX_REGISTERED - 1; i++) {
-            registered_ids[i] = registered_ids[i + 1];
+            memcpy(registered_macs[i].addr, registered_macs[i + 1].addr, 6);
         }
-        registered_ids[MAX_REGISTERED - 1] = id;
+        memcpy(registered_macs[MAX_REGISTERED - 1].addr, devices[device_idx].addr, 6);
         printf("Registered device ID %d (removed oldest)\n", id);
     } else {
-        registered_ids[registered_count++] = id;
+        memcpy(registered_macs[registered_count].addr, devices[device_idx].addr, 6);
+        registered_count++;
         printf("Registered device ID %d (%d/%d)\n", id, registered_count, MAX_REGISTERED);
     }
+
+    // Save to NVS
+    save_registered_to_nvs();
 }
 
 // Deregister a device by ID
 static void deregister_device(int id) {
+    // Find device by ID
+    int device_idx = -1;
+    for (int i = 0; i < device_count; i++) {
+        if (devices[i].id == id) {
+            device_idx = i;
+            break;
+        }
+    }
+
+    if (device_idx == -1) {
+        printf("Device ID %d not found.\n", id);
+        return;
+    }
+
+    // Find in registered list by MAC
     for (int i = 0; i < registered_count; i++) {
-        if (registered_ids[i] == id) {
+        if (memcmp(registered_macs[i].addr, devices[device_idx].addr, 6) == 0) {
             // Shift remaining items
             for (int j = i; j < registered_count - 1; j++) {
-                registered_ids[j] = registered_ids[j + 1];
+                memcpy(registered_macs[j].addr, registered_macs[j + 1].addr, 6);
             }
             registered_count--;
             printf("Deregistered device ID %d\n", id);
+
+            // Save to NVS
+            save_registered_to_nvs();
             return;
         }
     }
@@ -150,31 +279,39 @@ static void deregister_device(int id) {
 
 // Initialize GPIO and RGB LED
 static void init_gpio(void) {
-    // Configure input GPIO
+    // Configure cable presence input (GPIO34 is input-only, no internal pull resistors)
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << GPIO_INPUT_PIN),
+        .pin_bit_mask = (1ULL << GPIO_PRESENCE_PIN),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,  // Input-only GPIO, use external pull-down
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&io_conf);
-    
-    // Configure relay output
-    io_conf.pin_bit_mask = (1ULL << GPIO_RELAY_PIN);
+
+    // Configure charger relay output
+    io_conf.pin_bit_mask = (1ULL << GPIO_CHARGER_RELAY);
     io_conf.mode = GPIO_MODE_OUTPUT;
     io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     gpio_config(&io_conf);
-    gpio_set_level(GPIO_RELAY_PIN, 0);  // Relay off initially
-    
+    gpio_set_level(GPIO_CHARGER_RELAY, 1);  // Charger ON initially
+    charger_relay_state = true;
+
+    // Configure alarm relay output
+    io_conf.pin_bit_mask = (1ULL << GPIO_ALARM_RELAY);
+    gpio_config(&io_conf);
+    gpio_set_level(GPIO_ALARM_RELAY, 0);  // Alarm OFF initially
+    alarm_relay_state = false;
+
     // Configure RGB LED pins
-    io_conf.pin_bit_mask = (1ULL << RGB_LED_RED_PIN) | 
-                           (1ULL << RGB_LED_GREEN_PIN) | 
+    io_conf.pin_bit_mask = (1ULL << RGB_LED_RED_PIN) |
+                           (1ULL << RGB_LED_GREEN_PIN) |
                            (1ULL << RGB_LED_BLUE_PIN);
     gpio_config(&io_conf);
-    
-    ESP_LOGI(TAG, "GPIO initialized - Input: %d, Relay: %d, RGB: R%d G%d B%d",
-             GPIO_INPUT_PIN, GPIO_RELAY_PIN, 
+
+    ESP_LOGI(TAG, "GPIO initialized - Presence: %d, Charger: %d, Alarm: %d, RGB: R%d G%d B%d",
+             GPIO_PRESENCE_PIN, GPIO_CHARGER_RELAY, GPIO_ALARM_RELAY,
              RGB_LED_RED_PIN, RGB_LED_GREEN_PIN, RGB_LED_BLUE_PIN);
 }
 
@@ -209,44 +346,133 @@ static void set_led_color(led_color_t color) {
     }
 }
 
-// Update relay based on registered tag status
-static void update_relay(void) {
-    // TODO: Implement relay logic based on tag presence
-    // Example: Turn relay ON if any registered tag is online
-    int online_count = 0;
+// Check if any registered tag is currently online
+static bool is_any_tag_online(void) {
+    if (registered_count == 0) return false;
+
     int64_t now = esp_timer_get_time() / 1000;
-    
     for (int i = 0; i < registered_count; i++) {
         for (int j = 0; j < device_count; j++) {
-            if (devices[j].id == registered_ids[i]) {
+            if (memcmp(devices[j].addr, registered_macs[i].addr, 6) == 0) {
                 int64_t elapsed = now - devices[j].last_seen;
-                if (elapsed < 5000) {  // Online if seen in last 5 seconds
-                    online_count++;
+                if (elapsed < TAG_ONLINE_THRESHOLD_MS) {
+                    last_tag_seen_time = now;  // Update last seen time
+                    return true;
                 }
                 break;
             }
         }
     }
-    
-    bool should_activate = (online_count > 0);
-    if (should_activate != relay_state) {
-        relay_state = should_activate;
-        gpio_set_level(GPIO_RELAY_PIN, relay_state ? 1 : 0);
-        ESP_LOGI(TAG, "Relay %s (online tags: %d/%d)", 
-                 relay_state ? "ON" : "OFF", online_count, registered_count);
-    }
+    return false;
 }
 
-// Monitor GPIO input task
-static void gpio_monitor_task(void *param) {
-    while (1) {
-        bool current_state = gpio_get_level(GPIO_INPUT_PIN);
-        if (current_state != gpio_input_state) {
-            gpio_input_state = current_state;
-            ESP_LOGI(TAG, "GPIO Input changed: %s", 
-                     gpio_input_state ? "HIGH" : "LOW");
-            // TODO: Add logic based on input state change
+// Update system state and control relays + LED
+static void update_system_state(void) {
+    int64_t now = esp_timer_get_time() / 1000;
+    int64_t time_since_tag = now - last_tag_seen_time;
+
+    system_state_t new_state;
+
+    if (cable_connected) {
+        // Cable connected - determine state based on tag presence timing
+        if (time_since_tag < TAG_PRESENT_THRESHOLD_MS) {
+            // State 1: Tag present (seen in last 60 seconds) - GREEN
+            new_state = STATE_CHARGING_TAG_PRESENT;
+        } else if (time_since_tag < TAG_RECENT_THRESHOLD_MS) {
+            // State 2: Tag recent (60s to 10min) - ORANGE
+            new_state = STATE_CHARGING_TAG_RECENT;
+        } else {
+            // State 3: Tag not present (>10min - alarm armed) - RED
+            new_state = STATE_CHARGING_ALARM_ARMED;
         }
+    } else {
+        // State 4: Cable disconnected - BLUE
+        new_state = STATE_NOT_CHARGING;
+    }
+
+    // State changed - log it
+    if (new_state != current_state) {
+        const char *state_names[] = {
+            "CHARGING_TAG_PRESENT",
+            "CHARGING_TAG_RECENT",
+            "CHARGING_ALARM_ARMED",
+            "NOT_CHARGING"
+        };
+        ESP_LOGI(TAG, "State change: %s -> %s",
+                 state_names[current_state], state_names[new_state]);
+        current_state = new_state;
+    }
+
+    // Control hardware based on state
+    bool new_charger_state = false;
+    bool new_alarm_state = false;
+    led_color_t new_led_color = LED_OFF;
+
+    switch (current_state) {
+        case STATE_CHARGING_TAG_PRESENT:
+            // Charger ON, alarm OFF, GREEN LED
+            new_charger_state = true;
+            new_alarm_state = false;
+            new_led_color = LED_GREEN;
+            break;
+
+        case STATE_CHARGING_TAG_RECENT:
+            // Charger ON, alarm OFF, ORANGE LED
+            new_charger_state = true;
+            new_alarm_state = false;
+            new_led_color = LED_ORANGE;
+            break;
+
+        case STATE_CHARGING_ALARM_ARMED:
+            // Charger ON, alarm ON (armed), RED LED
+            new_charger_state = true;
+            new_alarm_state = true;
+            new_led_color = LED_RED;
+            break;
+
+        case STATE_NOT_CHARGING:
+            // Charger OFF (cable disconnected), alarm OFF, BLUE LED
+            new_charger_state = false;
+            new_alarm_state = false;
+            new_led_color = LED_BLUE;
+            break;
+    }
+
+    // Update charger relay if changed
+    if (new_charger_state != charger_relay_state) {
+        charger_relay_state = new_charger_state;
+        gpio_set_level(GPIO_CHARGER_RELAY, charger_relay_state ? 1 : 0);
+        ESP_LOGI(TAG, "Charger relay: %s", charger_relay_state ? "ON" : "OFF");
+    }
+
+    // Update alarm relay if changed
+    if (new_alarm_state != alarm_relay_state) {
+        alarm_relay_state = new_alarm_state;
+        gpio_set_level(GPIO_ALARM_RELAY, alarm_relay_state ? 1 : 0);
+        ESP_LOGI(TAG, "Alarm relay: %s", alarm_relay_state ? "ON" : "OFF");
+    }
+
+    // Update LED
+    set_led_color(new_led_color);
+}
+
+// Monitor cable presence and update system
+static void system_monitor_task(void *param) {
+    while (1) {
+        // Read cable presence pin (HIGH = cable connected, LOW = disconnected)
+        bool current_cable_state = gpio_get_level(GPIO_PRESENCE_PIN);
+
+        if (current_cable_state != cable_connected) {
+            cable_connected = current_cable_state;
+            ESP_LOGI(TAG, "Cable %s", cable_connected ? "CONNECTED" : "DISCONNECTED");
+        }
+
+        // Check if any registered tag is online (updates last_tag_seen_time)
+        is_any_tag_online();
+
+        // Update system state and hardware
+        update_system_state();
+
         vTaskDelay(pdMS_TO_TICKS(100));  // Check every 100ms
     }
 }
@@ -441,32 +667,35 @@ static void print_devices_task(void *param) {
         printf("Registered devices online: %d/%d | Type ID+ENTER to register/deregister\n", active_count, registered_count);
         printf("=========================================================================\n\n");
 
-        // Update LED color based on registered device status
-        if (registered_count == 0) {
-            set_led_color(LED_BLUE);  // No devices registered
-        } else {
-            int online = 0, warning = 0, offline = 0;
-            int64_t now_led = esp_timer_get_time() / 1000;
-            
-            for (int i = 0; i < registered_count; i++) {
-                for (int j = 0; j < device_count; j++) {
-                    if (devices[j].id == registered_ids[i]) {
-                        int64_t elapsed = now_led - devices[j].last_seen;
-                        if (elapsed < 5000) online++;
-                        else if (elapsed < 30000) warning++;
-                        else offline++;
-                        break;
-                    }
-                }
+        // Display system status
+        const char *state_names[] = {
+            "CHARGING_TAG_PRESENT",
+            "CHARGING_TAG_RECENT",
+            "CHARGING_ALARM_ARMED",
+            "NOT_CHARGING"
+        };
+        const char *led_colors[] = {"GREEN", "ORANGE", "RED", "BLUE"};
+        printf("\n*** System Status ***\n");
+        printf("State: %s (%s LED)\n", state_names[current_state], led_colors[current_state]);
+        printf("Cable: %s | Charger: %s | Alarm: %s\n",
+               cable_connected ? "CONNECTED" : "DISCONNECTED",
+               charger_relay_state ? "ON" : "OFF",
+               alarm_relay_state ? "ARMED" : "OFF");
+
+        int64_t time_since_tag = (now - last_tag_seen_time) / 1000;  // seconds
+        if (last_tag_seen_time > 0) {
+            printf("Last tag seen: %lld seconds ago\n", time_since_tag);
+            if (time_since_tag < 60) {
+                printf("  Status: Tag PRESENT\n");
+            } else if (time_since_tag < 600) {
+                printf("  Status: Tag RECENT (%d min left)\n", 10 - (int)(time_since_tag / 60));
+            } else {
+                printf("  Status: Alarm ARMED (no tag for >10min)\n");
             }
-            
-            if (offline > 0) set_led_color(LED_RED);
-            else if (warning > 0) set_led_color(LED_ORANGE);
-            else set_led_color(LED_GREEN);
+        } else {
+            printf("No registered tag seen yet\n");
         }
-        
-        // Update relay
-        update_relay();
+        printf("*********************\n");
     }
 }
 
@@ -518,6 +747,9 @@ void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // Load registered devices from NVS
+    load_registered_from_nvs();
 
     // Release memory for classic BT (we only need BLE)
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
@@ -583,15 +815,17 @@ void app_main(void) {
     uart_param_config(UART_NUM, &uart_config);
     uart_driver_install(UART_NUM, BUF_SIZE * 2, 0, 0, NULL, 0);
 
-    
+
     // Initialize GPIO and start monitoring
     init_gpio();
-    set_led_color(LED_BLUE);  // Blue during initialization
+    set_led_color(LED_GREEN);  // Start in charging state
+    cable_connected = gpio_get_level(GPIO_PRESENCE_PIN);  // Read initial state
+    ESP_LOGI(TAG, "Initial cable state: %s", cable_connected ? "CONNECTED" : "DISCONNECTED");
 
     // Start tasks
     xTaskCreate(print_devices_task, "print_devices", 4096, NULL, 5, NULL);
     xTaskCreate(console_input_task, "console_input", 4096, NULL, 5, NULL);
-    xTaskCreate(gpio_monitor_task, "gpio_monitor", 2048, NULL, 5, NULL);
+    xTaskCreate(system_monitor_task, "system_monitor", 2048, NULL, 5, NULL);
 
     // Main loop
     while (1) {
