@@ -29,20 +29,45 @@ This system monitors your bike's charging cable and BLE tag presence to:
 
 ## Features
 
-- Scans for up to 50 BLE devices
-- Register up to 5 tags for monitoring (FIFO queue)
-- 4-state system with automatic relay control
-- Interactive registration via UART (type device ID + ENTER)
-- Real-time status updates every 5 seconds
+- **BLE Scanning**: 30-second initial scan, continuous scanning after config
+- **WiFi Configuration Portal**: Auto-launches after boot for device registration
+- **Web Interface**: Browser-based device management with captive portal support
+- **NVS Storage**: Persistent device registration across reboots
+- **4-State System**: Automatic charger/alarm control based on tag presence
+- **LED Indicators**: RGB status LED + internal LED for AP mode
+- **Multi-Platform**: iOS, Android, Windows captive portal detection
+
+## Quick Start
+
+1. **Initial Setup**
+   - Power on ESP32 → 30-second BLE scan
+   - Connect to WiFi: `TAG-SCANNER` (open network)
+   - Captive portal auto-opens at `192.168.4.1`
+   - Register up to 5 BLE tags via web interface
+   - Click "Save & Exit" or wait for timeout
+
+2. **Normal Operation**
+   - Continuous BLE scanning and monitoring
+   - RGB LED shows system state
+   - Serial console shows device list (115200 baud)
+   - Type device ID + ENTER to register/unregister via UART
+
+## System States
+
+| State | LED Color | Cable | Tag Status | Charger | Alarm |
+|-------|-----------|-------|------------|---------|-------|
+| **TAG_PRESENT** | 🟢 Green | Connected | <60s ago | ON | OFF |
+| **TAG_RECENT** | 🟠 Orange | Connected | 60s-10min | ON | OFF |
+| **ALARM_ARMED** | 🔴 Red | Connected | >10min | ON | ON |
+| **NOT_CHARGING** | 🔵 Blue | Disconnected | Any | OFF | OFF |
 
 ## Hardware
 
-- **MCU**: ESP32 (original - 2MB flash minimum)
-- **UART**: Console at 115200 baud
-- **12V Relay Module**: For cable presence detection (3rd pin monitoring)
-- **2-Channel Relay Module**: For charger power and alarm control
-- **RGB LED**: Common cathode with current-limiting resistors
-- **Power Supply**: 5V for ESP32, 12V from bike battery for presence detection
+- **ESP32** (2MB flash minimum) with WiFi/BLE
+- **12V Relay**: Cable presence detection
+- **2-Channel Relay**: Charger (220V AC) + Alarm control
+- **RGB LED**: Common cathode + 220Ω resistors
+- **Power**: 5V for ESP32, 12V from bike for detection
 
 ## Wiring Diagram
 
@@ -87,7 +112,7 @@ This system monitors your bike's charging cable and BLE tag presence to:
 └──────────────┘  │                                                │
                   │                                                │
                   │                                                │
-┌─────────────────┴────────────────────────────────────────────────────────┐
+┌─────────────────┴────────────────────────────────────────────────┴───────┐
 │                   12V Relay Module (Presence Detection)                  │
 │                                                                          │
 │   12V+ (from bike 3rd pin) ──→ Coil (+)                                  │
@@ -291,4 +316,44 @@ Edit `src/main.c` to configure GPIO pins and timing:
 
 ## License
 
-Private project - not for redistribution
+Private project
+. ~/esp/esp-idf-v5.5/export.sh
+idf.py build
+idf.py -p /dev/ttyUSB0 -b 1500000 flash monitor
+# Exit monitor: Ctrl+]
+```
+
+## Configuration Modes
+
+### WiFi AP Mode (Initial Setup)
+- **Trigger**: Automatic after 30-second BLE scan on boot
+- **SSID**: `TAG-SCANNER` (open network)
+- **IP**: `192.168.4.1`
+- **Captive Portal**: Auto-opens on iOS, Android, Windows
+- **Timeouts**:
+  - 1 minute if no client connects
+  - 2 minutes after client connects
+- **Exit**: "Save & Exit" button or timeout
+- **LED**: Internal LED (GPIO2) blinks during AP mode
+
+### Serial Console Mode (Advanced)
+- **Baud**: 115200
+- **Commands**: Type device ID (1-99) + ENTER to register/unregister
+- **Display**: Updates every 5 seconds with device list and system status
+
+## Configuration
+
+Edit `src/main.c` to customize:
+
+```c
+// WiFi AP
+#define WIFI_AP_SSID "TAG-SCANNER"
+#define WIFI_AP_NO_CLIENT_TIMEOUT_MS (60 * 1000)
+#define WIFI_AP_CLIENT_CONNECTED_TIMEOUT_MS (2 * 60 * 1000)
+
+// Timing
+#define TAG_PRESENT_THRESHOLD_MS     60000
+#define TAG_RECENT_THRESHOLD_MS      (10 * 60 * 1000)
+
+// BLE Scan
+#define BLE_SCAN_DURATION_MS 30000

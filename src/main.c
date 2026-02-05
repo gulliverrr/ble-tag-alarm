@@ -14,8 +14,38 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "lwip/dns.h"
+#include "lwip/sockets.h"
 
 static const char *TAG = "BLE_SCANNER";
+
+// WiFi AP Configuration
+#define WIFI_AP_SSID "TAG-SCANNER"
+#define WIFI_AP_CHANNEL 1
+#define WIFI_AP_MAX_CONN 4
+#define WIFI_AP_NO_CLIENT_TIMEOUT_MS (60 * 1000)  // 1 minute if no client connects
+#define WIFI_AP_CLIENT_CONNECTED_TIMEOUT_MS (2 * 60 * 1000)  // 2 minutes after client connects
+
+static httpd_handle_t server = NULL;
+static int64_t ap_start_time = 0;
+static int64_t ap_last_client_time = 0;
+static bool ap_active = false;
+static bool ap_has_clients = false;
+
+// BLE Scan Phase Configuration
+#define BLE_SCAN_DURATION_MS 30000  // 30 seconds
+
+static bool ble_scan_complete = false;
+static bool wifi_ap_started = false;
+static esp_netif_t *wifi_ap_netif = NULL;  // Track netif for proper cleanup
+static int dns_server_socket = -1;  // DNS server socket
+static TaskHandle_t dns_task_handle = NULL;  // DNS task handle
 
 #define NVS_NAMESPACE "ble_alarm"
 #define NVS_REGISTERED_KEY "reg_devices"
@@ -32,6 +62,7 @@ static const char *TAG = "BLE_SCANNER";
 #define RGB_LED_RED_PIN    GPIO_NUM_25  // RGB LED Red channel
 #define RGB_LED_GREEN_PIN  GPIO_NUM_27  // RGB LED Green channel
 #define RGB_LED_BLUE_PIN   GPIO_NUM_32  // RGB LED Blue channel
+#define INTERNAL_LED_PIN   GPIO_NUM_2   // Internal LED for AP mode indication
 
 // Timing constants
 #define TAG_PRESENT_THRESHOLD_MS     60000              // Tag considered present if seen in last 60s
@@ -45,9 +76,13 @@ typedef struct {
     int64_t last_seen;
     bool active;
     char name[32];
+    char complete_name[32];
     uint8_t addr_type;
     uint16_t appearance;
     bool has_name;
+    bool has_complete_name;
+    uint16_t manufacturer_id;
+    bool has_manufacturer;
 } ble_device_t;
 
 static ble_device_t devices[MAX_DEVICES];
@@ -172,9 +207,13 @@ static int find_or_add_device(uint8_t *addr) {
         memcpy(devices[device_count].addr, addr, 6);
         devices[device_count].active = true;
         devices[device_count].has_name = false;
+        devices[device_count].has_complete_name = false;
+        devices[device_count].has_manufacturer = false;
         devices[device_count].name[0] = '\0';
+        devices[device_count].complete_name[0] = '\0';
         devices[device_count].appearance = 0;
         devices[device_count].addr_type = 0;
+        devices[device_count].manufacturer_id = 0;
         return device_count++;
     }
 
@@ -189,6 +228,21 @@ static bool is_registered_mac(uint8_t *addr) {
         }
     }
     return false;
+}
+
+// Get manufacturer name from company ID
+static const char* get_manufacturer_name(uint16_t company_id) {
+    switch(company_id) {
+        case 0x089A: return "Teltonika";
+        case 0x004C: return "Apple Inc.";
+        case 0x0006: return "Microsoft";
+        case 0x0075: return "Samsung Electronics";
+        case 0x00E0: return "Google";
+        case 0x0087: return "Garmin";
+        case 0x0157: return "Huawei";
+        case 0x0171: return "Xiaomi";
+        default: return "Unknown";
+    }
 }
 
 // Check if device ID is registered (for display purposes)
@@ -307,8 +361,10 @@ static void init_gpio(void) {
     // Configure RGB LED pins
     io_conf.pin_bit_mask = (1ULL << RGB_LED_RED_PIN) |
                            (1ULL << RGB_LED_GREEN_PIN) |
-                           (1ULL << RGB_LED_BLUE_PIN);
+                           (1ULL << RGB_LED_BLUE_PIN) |
+                           (1ULL << INTERNAL_LED_PIN);
     gpio_config(&io_conf);
+    gpio_set_level(INTERNAL_LED_PIN, 0);  // Start off
 
     ESP_LOGI(TAG, "GPIO initialized - Presence: %d, Charger: %d, Alarm: %d, RGB: R%d G%d B%d",
              GPIO_PRESENCE_PIN, GPIO_CHARGER_RELAY, GPIO_ALARM_RELAY,
@@ -477,6 +533,559 @@ static void system_monitor_task(void *param) {
     }
 }
 
+// ===== BLE Cleanup Function =====
+
+// Forward declarations for WiFi functions
+static void wifi_init_softap(void);
+static httpd_handle_t start_webserver(void);
+static void ap_monitor_task(void *param);
+
+// DNS server task - responds to all DNS queries with ESP32's IP
+static void dns_server_task(void *param) {
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(53);  // DNS port
+
+    dns_server_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (dns_server_socket < 0) {
+        ESP_LOGE(TAG, "Failed to create DNS socket");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (bind(dns_server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        ESP_LOGE(TAG, "DNS socket bind failed");
+        close(dns_server_socket);
+        dns_server_socket = -1;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Set socket to non-blocking mode
+    int flags = fcntl(dns_server_socket, F_GETFL, 0);
+    fcntl(dns_server_socket, F_SETFL, flags | O_NONBLOCK);
+
+    ESP_LOGI(TAG, "DNS server started on port 53");
+
+    uint8_t rx_buffer[512];
+    struct sockaddr_in client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+
+    while (ap_active) {
+        int len = recvfrom(dns_server_socket, rx_buffer, sizeof(rx_buffer) - 1, 0,
+                          (struct sockaddr *)&client_addr, &client_addr_len);
+
+        if (len > 0) {
+            // Build DNS response - return our IP (192.168.4.1) for all queries
+            uint8_t response[512];
+            memcpy(response, rx_buffer, len);  // Copy query
+
+            // Set response flags (standard query response, no error)
+            response[2] = 0x81;  // Response, recursion available
+            response[3] = 0x80;  // No error
+
+            // Answer count = 1
+            response[6] = 0x00;
+            response[7] = 0x01;
+
+            // Build answer section at end of query
+            int answer_offset = len;
+
+            // Name pointer to query name (compression)
+            response[answer_offset++] = 0xC0;
+            response[answer_offset++] = 0x0C;
+
+            // Type A (IPv4 address)
+            response[answer_offset++] = 0x00;
+            response[answer_offset++] = 0x01;
+
+            // Class IN
+            response[answer_offset++] = 0x00;
+            response[answer_offset++] = 0x01;
+
+            // TTL (60 seconds)
+            response[answer_offset++] = 0x00;
+            response[answer_offset++] = 0x00;
+            response[answer_offset++] = 0x00;
+            response[answer_offset++] = 0x3C;
+
+            // Data length (4 bytes for IPv4)
+            response[answer_offset++] = 0x00;
+            response[answer_offset++] = 0x04;
+
+            // IP address 192.168.4.1
+            response[answer_offset++] = 192;
+            response[answer_offset++] = 168;
+            response[answer_offset++] = 4;
+            response[answer_offset++] = 1;
+
+            sendto(dns_server_socket, response, answer_offset, 0,
+                  (struct sockaddr *)&client_addr, client_addr_len);
+        } else {
+            // No data, sleep briefly to avoid busy-waiting
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+
+    close(dns_server_socket);
+    dns_server_socket = -1;
+    ESP_LOGI(TAG, "DNS server stopped");
+    vTaskDelete(NULL);
+}
+
+static void cleanup_ble_stack(void) {
+    ESP_LOGI(TAG, "Stopping and deinitializing BLE stack...");
+
+    // Stop scanning
+    esp_ble_gap_stop_scanning();
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Disable and deinitialize Bluedroid
+    esp_err_t ret = esp_bluedroid_disable();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Bluedroid disable failed: %s", esp_err_to_name(ret));
+    }
+
+    ret = esp_bluedroid_deinit();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Bluedroid deinit failed: %s", esp_err_to_name(ret));
+    }
+
+    // Disable and deinitialize BT controller
+    ret = esp_bt_controller_disable();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "BT controller disable failed: %s", esp_err_to_name(ret));
+    }
+
+    ret = esp_bt_controller_deinit();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "BT controller deinit failed: %s", esp_err_to_name(ret));
+    }
+
+    ESP_LOGI(TAG, "BLE stack fully deinitialized - IRAM freed");
+}
+
+// Timer callback to complete BLE scan and start WiFi
+static void ble_scan_timer_callback(void* arg) {
+    // Just set flag - can't do heavy operations in ISR context
+    ble_scan_complete = true;
+}
+
+// ===== WiFi AP and HTTP Server Functions =====
+
+// HTTP handler for common captive portal detection URLs
+static esp_err_t captive_detect_handler(httpd_req_t *req) {
+    // Redirect to main configuration page to trigger captive portal
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+    const char* redirect = "<html><head><meta http-equiv='refresh' content='0;url=http://192.168.4.1/'></head><body>Redirecting...</body></html>";
+    httpd_resp_send(req, redirect, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// HTTP handler for captive portal - redirect all unknown requests to root
+static esp_err_t captive_portal_handler(httpd_req_t *req) {
+    const char* redirect =
+        "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='0;url=http://192.168.4.1/'>"
+        "</head><body>Redirecting...</body></html>";
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+    httpd_resp_send(req, redirect, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// HTTP handler for root page (web interface)
+static esp_err_t root_get_handler(httpd_req_t *req) {
+    char *html_page = malloc(4096);
+    if (!html_page) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    snprintf(html_page, 4096,
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>BLE Tag Alarm</title><style>"
+        "body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0}"
+        ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}"
+        "h1{color:#333;text-align:center}h2{color:#555;border-bottom:2px solid #4CAF50;padding-bottom:5px}"
+        ".device{background:#f9f9f9;padding:10px;margin:10px 0;border-radius:5px;border-left:4px solid #2196F3}"
+        ".device.registered{border-left-color:#4CAF50}.device.online{background:#e8f5e9}"
+        ".btn{padding:8px 15px;margin:5px;border:none;border-radius:4px;cursor:pointer;font-size:14px}"
+        ".btn-register{background:#4CAF50;color:white}.btn-unregister{background:#f44336;color:white}"
+        ".btn:hover{opacity:0.8}.info{color:#666;font-size:14px}.timeout{color:#FF9800;font-weight:bold;text-align:center;font-size:16px}"
+        ".mac{font-family:monospace;color:#333}.rssi{color:#888;font-size:12px}"
+        "</style></head><body><div class='container'>"
+        "<h1>🔒 BLE Tag Alarm</h1>"
+        "<p class='timeout'>AP will shutdown in: <span id='countdown'>--:--</span></p>"
+        "<div style='text-align:center;margin:20px 0'>"
+        "<button class='btn' style='background:#2196F3;color:white;padding:12px 30px;font-size:16px' onclick='saveAndExit()'>💾 Save & Exit AP Mode</button>"
+        "</div>"
+        "<h2>📡 Detected Devices</h2><div id='devices'>Loading...</div>"
+        "<script>"
+        "let apStartTime=Date.now();"
+        "let clientConnectedTimeout=%d;"
+        "let noClientTimeout=%d;"
+        "let hasClient=false;"
+        "function updateCountdown(){"
+        "let elapsed=Date.now()-apStartTime;"
+        "let remaining=hasClient?clientConnectedTimeout-elapsed:noClientTimeout-elapsed;"
+        "if(remaining<=0){document.getElementById('countdown').textContent='SHUTTING DOWN';return;}"
+        "let mins=Math.floor(remaining/60000);let secs=Math.floor((remaining%%60000)/1000);"
+        "document.getElementById('countdown').textContent=mins+':'+(secs<10?'0':'')+secs;"
+        "}"
+        "setInterval(updateCountdown,1000);updateCountdown();"
+        "async function fetchDevices(){"
+        "try{let res=await fetch('/api/devices');let data=await res.json();"
+        "let html='';data.devices.forEach(d=>{"
+        "let onlineClass=d.online?' online':'';"
+        "let regClass=d.registered?' registered':'';"
+        "html+='<div class=\"device'+onlineClass+regClass+'\">';"
+        "let displayName=(d.manufacturer&&d.manufacturer!=='Unknown'?d.manufacturer+' - ':'')+d.name;"
+        "html+='<div><strong>'+displayName+'</strong></div>';"
+        "html+='<div class=\"mac\">MAC: '+d.mac+'</div>';"
+        "html+='<div class=\"rssi\">RSSI: '+d.rssi+' dBm | Last seen: '+d.last_seen_ago+'</div>';"
+        "if(d.registered){"
+        "html+='<button class=\"btn btn-unregister\" onclick=\"unregisterDevice('+d.id+')\">❌ Unregister</button>';"
+        "}else{"
+        "html+='<button class=\"btn btn-register\" onclick=\"registerDevice('+d.id+')\">✅ Register</button>';"
+        "}"
+        "html+='</div>';});"
+        "document.getElementById('devices').innerHTML=html||'<p class=\"info\">No devices detected</p>';"
+        "}catch(e){document.getElementById('devices').innerHTML='<p class=\"info\">Error loading devices</p>';}}"
+        "async function registerDevice(id){"
+        "try{await fetch('/api/register?id='+id,{method:'POST'});fetchDevices();}catch(e){alert('Failed to register');}}"
+        "async function unregisterDevice(id){"
+        "try{await fetch('/api/unregister?id='+id,{method:'POST'});fetchDevices();}catch(e){alert('Failed to unregister');}}"
+        "async function saveAndExit(){"
+        "if(confirm('Save configuration and exit AP mode?')){"
+        "try{await fetch('/api/save',{method:'POST'});}catch(e){alert('Failed to save');}}}"
+        "setInterval(fetchDevices,3000);fetchDevices();"
+        "fetch('/api/devices').then(r=>r.json()).then(d=>{if(d.devices.length>0)hasClient=true;});"
+        "</script></div></body></html>",
+        WIFI_AP_CLIENT_CONNECTED_TIMEOUT_MS, WIFI_AP_NO_CLIENT_TIMEOUT_MS);
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
+    free(html_page);
+    return ESP_OK;
+}
+
+// HTTP handler for device list API
+static esp_err_t api_devices_handler(httpd_req_t *req) {
+    char *json_response = malloc(8192);
+    if (!json_response) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    int pos = sprintf(json_response, "{\"devices\":[");
+    int64_t now = esp_timer_get_time() / 1000;
+
+    for (int i = 0; i < device_count; i++) {
+        if (!devices[i].active) continue;
+
+        int64_t ago = now - devices[i].last_seen;
+        bool online = (ago < TAG_ONLINE_THRESHOLD_MS);
+        bool registered = is_registered_mac(devices[i].addr);
+
+        pos += sprintf(json_response + pos,
+            "%s{\"id\":%d,\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
+            "\"name\":\"%s\",\"manufacturer\":\"%s\",\"rssi\":%d,\"last_seen_ago\":\"%lld s\","
+            "\"online\":%s,\"registered\":%s}",
+            (i > 0 && pos > 13) ? "," : "",
+            devices[i].id,
+            devices[i].addr[0], devices[i].addr[1], devices[i].addr[2],
+            devices[i].addr[3], devices[i].addr[4], devices[i].addr[5],
+            devices[i].has_name ? devices[i].name : "Unknown",
+            devices[i].has_manufacturer ? get_manufacturer_name(devices[i].manufacturer_id) : "Unknown",
+            devices[i].rssi,
+            ago / 1000,
+            online ? "true" : "false",
+            registered ? "true" : "false");
+    }
+
+    pos += sprintf(json_response + pos, "]}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_response, pos);
+    free(json_response);
+    return ESP_OK;
+}
+
+// HTTP handler for device registration
+static esp_err_t api_register_handler(httpd_req_t *req) {
+    char query[64];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char id_str[16];
+        if (httpd_query_key_value(query, "id", id_str, sizeof(id_str)) == ESP_OK) {
+            int id = atoi(id_str);
+            register_device(id);
+            httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+            return ESP_OK;
+        }
+    }
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing id parameter");
+    return ESP_FAIL;
+}
+
+// HTTP handler for device unregistration
+static esp_err_t api_unregister_handler(httpd_req_t *req) {
+    char query[64];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char id_str[16];
+        if (httpd_query_key_value(query, "id", id_str, sizeof(id_str)) == ESP_OK) {
+            int id = atoi(id_str);
+            deregister_device(id);
+            httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+            return ESP_OK;
+        }
+    }
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing id parameter");
+    return ESP_FAIL;
+}
+
+// HTTP handler for save and exit
+static esp_err_t api_save_handler(httpd_req_t *req) {
+    // Configuration is already saved by register/unregister handlers
+    // Just trigger AP shutdown
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+
+    // Set flag to stop AP immediately
+    ap_active = false;
+    ESP_LOGI(TAG, "User requested save & exit - shutting down AP");
+
+    return ESP_OK;
+}
+
+// Start HTTP server
+static httpd_handle_t start_webserver(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.max_uri_handlers = 8;
+    config.stack_size = 8192;
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t root = {
+            .uri = "/",
+            .method = HTTP_GET,
+            .handler = root_get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &root);
+
+        httpd_uri_t api_devices = {
+            .uri = "/api/devices",
+            .method = HTTP_GET,
+            .handler = api_devices_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_devices);
+
+        httpd_uri_t api_register = {
+            .uri = "/api/register",
+            .method = HTTP_POST,
+            .handler = api_register_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_register);
+
+        httpd_uri_t api_unregister = {
+            .uri = "/api/unregister",
+            .method = HTTP_POST,
+            .handler = api_unregister_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_unregister);
+
+        httpd_uri_t api_save = {
+            .uri = "/api/save",
+            .method = HTTP_POST,
+            .handler = api_save_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_save);
+
+        // iOS/macOS captive portal detection
+        httpd_uri_t hotspot_detect = {
+            .uri = "/hotspot-detect.html",
+            .method = HTTP_GET,
+            .handler = captive_detect_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &hotspot_detect);
+
+        // Android captive portal detection
+        httpd_uri_t generate_204 = {
+            .uri = "/generate_204",
+            .method = HTTP_GET,
+            .handler = captive_detect_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &generate_204);
+
+        // Windows captive portal detection
+        httpd_uri_t connecttest = {
+            .uri = "/connecttest.txt",
+            .method = HTTP_GET,
+            .handler = captive_detect_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &connecttest);
+
+        // Generic success page
+        httpd_uri_t success = {
+            .uri = "/success.txt",
+            .method = HTTP_GET,
+            .handler = captive_detect_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &success);
+
+        // Captive portal catch-all handler - must be last
+        httpd_uri_t captive = {
+            .uri = "/*",
+            .method = HTTP_GET,
+            .handler = captive_portal_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &captive);
+
+        ESP_LOGI(TAG, "HTTP server started on http://192.168.4.1");
+        return server;
+    }
+
+    ESP_LOGE(TAG, "Failed to start HTTP server");
+    return NULL;
+}
+
+// WiFi event handler
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data) {
+    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI(TAG, "Station connected: %02x:%02x:%02x:%02x:%02x:%02x",
+                 event->mac[0], event->mac[1], event->mac[2],
+                 event->mac[3], event->mac[4], event->mac[5]);
+        if (!ap_has_clients) {
+            ap_has_clients = true;
+            ap_last_client_time = esp_timer_get_time() / 1000;
+            ESP_LOGI(TAG, "First client connected - starting 2-minute countdown");
+        }
+    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+        ESP_LOGI(TAG, "Station disconnected: %02x:%02x:%02x:%02x:%02x:%02x",
+                 event->mac[0], event->mac[1], event->mac[2],
+                 event->mac[3], event->mac[4], event->mac[5]);
+    }
+}
+
+// Initialize WiFi AP
+static void wifi_init_softap(void) {
+    // Initialize network interface (OK if already initialized)
+    esp_err_t ret = esp_netif_init();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(ret);
+    }
+
+    // Create event loop (OK if already exists)
+    ret = esp_event_loop_create_default();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(ret);
+    }
+
+    // Create netif if it doesn't exist
+    if (!wifi_ap_netif) {
+        wifi_ap_netif = esp_netif_create_default_wifi_ap();
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = WIFI_AP_SSID,
+            .ssid_len = strlen(WIFI_AP_SSID),
+            .channel = WIFI_AP_CHANNEL,
+            .password = "",
+            .max_connection = WIFI_AP_MAX_CONN,
+            .authmode = WIFI_AUTH_OPEN,  // No password
+            .pmf_cfg = {
+                .required = false,
+            },
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Start DNS server task for captive portal
+    xTaskCreate(dns_server_task, "dns_server", 4096, NULL, 5, &dns_task_handle);
+
+    ESP_LOGI(TAG, "WiFi AP started: SSID=%s, Channel=%d", WIFI_AP_SSID, WIFI_AP_CHANNEL);
+    ESP_LOGI(TAG, "Connect to http://192.168.4.1 to manage devices");
+}
+
+// AP monitor task - shuts down AP after timeout
+static void ap_monitor_task(void *param) {
+    while (ap_active) {
+        int64_t now = esp_timer_get_time() / 1000;
+        int64_t elapsed = now - ap_start_time;
+
+        // Check timeout conditions
+        // Timeout if no client connects within 1 minute
+        if (!ap_has_clients && elapsed >= WIFI_AP_NO_CLIENT_TIMEOUT_MS) {
+            ESP_LOGI(TAG, "AP no-client timeout (1 min), shutting down WiFi AP");
+            ap_active = false;  // Trigger shutdown
+        }
+        // Or timeout 2 minutes after client connects
+        else if (ap_has_clients && (now - ap_last_client_time) >= WIFI_AP_CLIENT_CONNECTED_TIMEOUT_MS) {
+            ESP_LOGI(TAG, "AP client-connected timeout (2 min), shutting down WiFi AP");
+            ap_active = false;  // Trigger shutdown
+        }
+
+        // Check if we should shutdown (either from timeout or manual trigger)
+        if (!ap_active) {
+            break;  // Exit loop to perform shutdown
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    // Shutdown AP (reached when ap_active becomes false)
+    ESP_LOGI(TAG, "Shutting down WiFi AP...");
+
+    // Give DNS server time to exit cleanly
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    if (server) {
+        httpd_stop(server);
+        server = NULL;
+    }
+
+    // DNS task should have exited by now
+    dns_task_handle = NULL;
+
+    esp_wifi_stop();
+    esp_wifi_deinit();
+
+    // Destroy netif to allow clean restart
+    if (wifi_ap_netif) {
+        esp_netif_destroy(wifi_ap_netif);
+        wifi_ap_netif = NULL;
+    }
+
+    ESP_LOGI(TAG, "WiFi AP stopped");
+    vTaskDelete(NULL);
+}
+
 // GAP callback
 static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
     switch (event) {
@@ -494,27 +1103,60 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
                     uint8_t *adv_data = scan_result->scan_rst.ble_adv;
                     uint8_t adv_data_len = scan_result->scan_rst.adv_data_len;
 
-                    for (int i = 0; i < adv_data_len;) {
-                        uint8_t len = adv_data[i];
+                    // Parse both advertisement data and scan response data
+                    for (int pass = 0; pass < 2; pass++) {
+                        uint8_t *data = (pass == 0) ? adv_data : scan_result->scan_rst.ble_adv;
+                        uint8_t data_len = (pass == 0) ? adv_data_len : scan_result->scan_rst.adv_data_len + scan_result->scan_rst.scan_rsp_len;
+
+                        // On second pass, use scan response if available
+                        if (pass == 1 && scan_result->scan_rst.scan_rsp_len > 0) {
+                            data = adv_data + adv_data_len;
+                            data_len = scan_result->scan_rst.scan_rsp_len;
+                        } else if (pass == 1) {
+                            break; // No scan response data
+                        }
+
+                    for (int i = 0; i < data_len;) {
+                        uint8_t len = data[i];
                         if (len == 0) break;
 
-                        uint8_t type = adv_data[i + 1];
+                        uint8_t type = data[i + 1];
 
-                        // Complete or shortened local name
-                        if (type == 0x09 || type == 0x08) {
+                        // Shortened local name
+                        if (type == 0x08 && !devices[idx].has_name) {
                             int name_len = len - 1;
                             if (name_len > 31) name_len = 31;
-                            memcpy(devices[idx].name, &adv_data[i + 2], name_len);
+                            memcpy(devices[idx].name, &data[i + 2], name_len);
                             devices[idx].name[name_len] = '\0';
                             devices[idx].has_name = true;
                         }
+                        // Complete local name
+                        else if (type == 0x09 && !devices[idx].has_complete_name) {
+                            int name_len = len - 1;
+                            if (name_len > 31) name_len = 31;
+                            memcpy(devices[idx].complete_name, &data[i + 2], name_len);
+                            devices[idx].complete_name[name_len] = '\0';
+                            devices[idx].has_complete_name = true;
+                            // Also copy to regular name if not set
+                            if (!devices[idx].has_name) {
+                                memcpy(devices[idx].name, &data[i + 2], name_len);
+                                devices[idx].name[name_len] = '\0';
+                                devices[idx].has_name = true;
+                            }
+                        }
                         // Appearance
                         else if (type == 0x19 && len >= 3) {
-                            devices[idx].appearance = adv_data[i + 2] | (adv_data[i + 3] << 8);
+                            devices[idx].appearance = data[i + 2] | (data[i + 3] << 8);
+                        }
+                        // Manufacturer Specific Data
+                        else if (type == 0xFF && len >= 3 && !devices[idx].has_manufacturer) {
+                            devices[idx].manufacturer_id = data[i + 2] | (data[i + 3] << 8);
+                            devices[idx].has_manufacturer = true;
                         }
 
                         i += len + 1;
                     }
+                    } // end pass loop
                 }
             }
             break;
@@ -532,6 +1174,83 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
 // Task to print devices every 5 seconds
 static void print_devices_task(void *param) {
     while (1) {
+        // Check if BLE scan completed and need to switch to AP mode
+        if (ble_scan_complete && !wifi_ap_started) {
+            ESP_LOGI(TAG, "BLE scan period (30s) complete. Found %d devices.", device_count);
+
+            // Clean up BLE stack to free IRAM
+            cleanup_ble_stack();
+
+            // Start WiFi AP
+            ESP_LOGI(TAG, "Starting WiFi AP for device management...");
+            wifi_init_softap();
+            ap_start_time = esp_timer_get_time() / 1000;
+            ap_last_client_time = ap_start_time;
+            ap_active = true;
+            ap_has_clients = false;
+            wifi_ap_started = true;
+
+            server = start_webserver();
+            if (server) {
+                xTaskCreate(ap_monitor_task, "ap_monitor", 4096, NULL, 5, NULL);
+            }
+
+            ESP_LOGI(TAG, "WiFi AP started. Connect to SSID: TAG-SCANNER, IP: 192.168.4.1");
+        }
+
+        // Flash internal LED if in AP mode
+        if (wifi_ap_started && ap_active) {
+            gpio_set_level(INTERNAL_LED_PIN, 1);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            gpio_set_level(INTERNAL_LED_PIN, 0);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;  // Skip device printing in AP mode
+        }
+
+        // If AP was active but stopped, turn off LED and reset flag
+        if (wifi_ap_started && !ap_active) {
+            gpio_set_level(INTERNAL_LED_PIN, 0);
+            wifi_ap_started = false;
+            ble_scan_complete = false;  // Reset flag so we don't restart AP immediately
+
+            // Reinitialize BLE for continuous scanning
+            ESP_LOGI(TAG, "Restarting BLE scanning after AP shutdown");
+
+            esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+            esp_err_t ret = esp_bt_controller_init(&bt_cfg);
+            if (ret == ESP_OK) {
+                ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+                if (ret == ESP_OK) {
+                    ret = esp_bluedroid_init();
+                    if (ret == ESP_OK) {
+                        ret = esp_bluedroid_enable();
+                        if (ret == ESP_OK) {
+                            ret = esp_ble_gap_register_callback(esp_gap_cb);
+                            if (ret == ESP_OK) {
+                                static esp_ble_scan_params_t ble_scan_params = {
+                                    .scan_type              = BLE_SCAN_TYPE_ACTIVE,
+                                    .own_addr_type          = BLE_ADDR_TYPE_PUBLIC,
+                                    .scan_filter_policy     = BLE_SCAN_FILTER_ALLOW_ALL,
+                                    .scan_interval          = 0x50,
+                                    .scan_window            = 0x30,
+                                    .scan_duplicate         = BLE_SCAN_DUPLICATE_DISABLE
+                                };
+                                esp_ble_gap_set_scan_params(&ble_scan_params);
+                                esp_ble_gap_start_scanning(0);
+                                ESP_LOGI(TAG, "BLE scanning resumed");
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to restart BLE: %s", esp_err_to_name(ret));
+            }
+
+            ESP_LOGI(TAG, "Resuming normal operation after AP shutdown");
+        }
+
         vTaskDelay(pdMS_TO_TICKS(5000));
 
         int64_t now = esp_timer_get_time() / 1000;
@@ -554,8 +1273,8 @@ static void print_devices_task(void *param) {
         }
 
         printf("\n========== BLE Devices (Time: %lld s) ==========\n", (now + 500) / 1000);
-        printf("%-3s %-20s %-6s %-8s %-20s %-6s\n", "ID", "MAC Address", "RSSI", "Type", "Name", "Status");
-        printf("-------------------------------------------------------------------------\n");
+        printf("%-3s %-20s %-6s %-8s %-35s %-6s\n", "ID", "MAC Address", "RSSI", "Type", "Device", "Status");
+        printf("-------------------------------------------------------------------------------------------------------\n");
 
         int active_count = 0;
         int displayed = 0;
@@ -604,11 +1323,24 @@ static void print_devices_task(void *param) {
                    devices[idx].addr[3], devices[idx].addr[4], devices[idx].addr[5],
                    devices[idx].rssi, addr_type_str);
 
-            if (devices[idx].has_name && strlen(devices[idx].name) > 0) {
-                printf("%-20s", devices[idx].name);
+            // Display <Manufacturer> - <Name> format
+            char display_name[64];
+            const char *device_name = "";
+            if (devices[idx].has_complete_name && strlen(devices[idx].complete_name) > 0) {
+                device_name = devices[idx].complete_name;
+            } else if (devices[idx].has_name && strlen(devices[idx].name) > 0) {
+                device_name = devices[idx].name;
             } else {
-                printf("%-20s", "(no name)");
+                device_name = "(no name)";
             }
+
+            if (devices[idx].has_manufacturer) {
+                snprintf(display_name, sizeof(display_name), "%s - %s",
+                        get_manufacturer_name(devices[idx].manufacturer_id), device_name);
+            } else {
+                snprintf(display_name, sizeof(display_name), "%s", device_name);
+            }
+            printf("%-35s", display_name);
 
             printf(" %-6s [%ds ago]", status, elapsed_sec);
 
@@ -646,11 +1378,24 @@ static void print_devices_task(void *param) {
                        devices[idx].addr[3], devices[idx].addr[4], devices[idx].addr[5],
                        devices[idx].rssi, addr_type_str);
 
-                if (devices[idx].has_name && strlen(devices[idx].name) > 0) {
-                    printf("%-20s", devices[idx].name);
+                // Display <Manufacturer> - <Name> format
+                char display_name[64];
+                const char *device_name = "";
+                if (devices[idx].has_complete_name && strlen(devices[idx].complete_name) > 0) {
+                    device_name = devices[idx].complete_name;
+                } else if (devices[idx].has_name && strlen(devices[idx].name) > 0) {
+                    device_name = devices[idx].name;
                 } else {
-                    printf("%-20s", "(no name)");
+                    device_name = "(no name)";
                 }
+
+                if (devices[idx].has_manufacturer) {
+                    snprintf(display_name, sizeof(display_name), "%s - %s",
+                            get_manufacturer_name(devices[idx].manufacturer_id), device_name);
+                } else {
+                    snprintf(display_name, sizeof(display_name), "%s", device_name);
+                }
+                printf("%-35s", display_name);
 
                 printf(" %-6s [%ds ago]", "-", elapsed_sec);
 
@@ -802,7 +1547,17 @@ void app_main(void) {
     // Start scanning (0 = continuous)
     esp_ble_gap_start_scanning(0);
 
-    ESP_LOGI(TAG, "BLE scanning started - looking for tags...");
+    ESP_LOGI(TAG, "=== BLE scan started for 30 seconds ===");
+    ESP_LOGI(TAG, "Looking for BLE tags...");
+
+    // Create timer to stop BLE scan after 30 seconds and start WiFi AP
+    const esp_timer_create_args_t timer_args = {
+        .callback = &ble_scan_timer_callback,
+        .name = "ble_scan_timer"
+    };
+    esp_timer_handle_t scan_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &scan_timer));
+    ESP_ERROR_CHECK(esp_timer_start_once(scan_timer, BLE_SCAN_DURATION_MS * 1000));  // microseconds
 
     // Configure UART for console input
     uart_config_t uart_config = {
