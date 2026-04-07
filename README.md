@@ -104,7 +104,7 @@ This system monitors your bike's charging cable and BLE tag presence to:
 │   GPIO32 ●───┼──┼──────────┼──[ 220Ω ]┤Cathode │  │              │
 │   (LED-B)    │  │          │          └────────┘  │              │
 │              │  │          │                      │              │
-│   3.3V ●─────┼──┼──────────┘                      │              │
+│   3.3V ●─────┼──●──────────┘                      │              │
 │              │  │                                 │              │
 │   GND ●──────┼──┼────[ 10kΩ ]─── (pull-down for GPIO34)          │
 │              │  │                                 │              │

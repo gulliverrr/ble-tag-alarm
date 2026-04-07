@@ -22,8 +22,18 @@
 #include "lwip/sys.h"
 #include "lwip/dns.h"
 #include "lwip/sockets.h"
+#include "sdkconfig.h"
 
 static const char *TAG = "BLE_SCANNER";
+
+// Relay polarity configuration
+#ifdef CONFIG_HESTIA32_RELAY_ACTIVE_LOW
+    #define RELAY_ON  0
+    #define RELAY_OFF 1
+#else
+    #define RELAY_ON  1
+    #define RELAY_OFF 0
+#endif
 
 // WiFi AP Configuration
 #define WIFI_AP_SSID "TAG-SCANNER"
@@ -349,13 +359,13 @@ static void init_gpio(void) {
     io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     gpio_config(&io_conf);
-    gpio_set_level(GPIO_CHARGER_RELAY, 1);  // Charger ON initially
+    gpio_set_level(GPIO_CHARGER_RELAY, RELAY_ON);  // Charger ON initially
     charger_relay_state = true;
 
     // Configure alarm relay output
     io_conf.pin_bit_mask = (1ULL << GPIO_ALARM_RELAY);
     gpio_config(&io_conf);
-    gpio_set_level(GPIO_ALARM_RELAY, 0);  // Alarm OFF initially
+    gpio_set_level(GPIO_ALARM_RELAY, RELAY_OFF);  // Alarm OFF initially
     alarm_relay_state = false;
 
     // Configure RGB LED pins
@@ -497,14 +507,14 @@ static void update_system_state(void) {
     // Update charger relay if changed
     if (new_charger_state != charger_relay_state) {
         charger_relay_state = new_charger_state;
-        gpio_set_level(GPIO_CHARGER_RELAY, charger_relay_state ? 1 : 0);
+        gpio_set_level(GPIO_CHARGER_RELAY, charger_relay_state ? RELAY_ON : RELAY_OFF);
         ESP_LOGI(TAG, "Charger relay: %s", charger_relay_state ? "ON" : "OFF");
     }
 
     // Update alarm relay if changed
     if (new_alarm_state != alarm_relay_state) {
         alarm_relay_state = new_alarm_state;
-        gpio_set_level(GPIO_ALARM_RELAY, alarm_relay_state ? 1 : 0);
+        gpio_set_level(GPIO_ALARM_RELAY, alarm_relay_state ? RELAY_ON : RELAY_OFF);
         ESP_LOGI(TAG, "Alarm relay: %s", alarm_relay_state ? "ON" : "OFF");
     }
 

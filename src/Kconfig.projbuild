@@ -1,5 +1,25 @@
 menu "Hestia32 Configuration"
 
+    choice HESTIA32_RELAY_POLARITY
+        prompt "Relay Trigger Polarity"
+        default HESTIA32_RELAY_ACTIVE_HIGH
+        help
+            Select whether relays are triggered on HIGH or LOW signal.
+            This applies to both the charger relay and alarm relay.
+
+        config HESTIA32_RELAY_ACTIVE_HIGH
+            bool "Active HIGH (trigger on 1)"
+            help
+                Relays are activated when GPIO is set to HIGH (1).
+                This is the typical configuration for most relay modules.
+
+        config HESTIA32_RELAY_ACTIVE_LOW
+            bool "Active LOW (trigger on 0)"
+            help
+                Relays are activated when GPIO is set to LOW (0).
+                Some relay modules use this inverted logic.
+    endchoice
+
     choice HESTIA32_PROTOCOL
         prompt "Communication Protocol"
         default HESTIA32_PROTOCOL_MQTT
