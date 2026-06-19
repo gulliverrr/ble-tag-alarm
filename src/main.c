@@ -550,6 +550,9 @@ static void wifi_init_softap(void);
 static httpd_handle_t start_webserver(void);
 static void ap_monitor_task(void *param);
 
+// Forward declaration for BLE GAP callback
+static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
+
 // DNS server task - responds to all DNS queries with ESP32's IP
 static void dns_server_task(void *param) {
     struct sockaddr_in server_addr;
@@ -674,6 +677,61 @@ static void cleanup_ble_stack(void) {
     }
 
     ESP_LOGI(TAG, "BLE stack fully deinitialized - IRAM freed");
+}
+
+// Reinitialize BLE stack and start continuous scanning
+static void reinit_ble_stack(void) {
+    ESP_LOGI(TAG, "Reinitializing BLE stack...");
+
+    // Initialize BT controller
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    esp_err_t ret = esp_bt_controller_init(&bt_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BT controller init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BT controller enable failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = esp_bluedroid_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Bluedroid init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = esp_bluedroid_enable();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Bluedroid enable failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    // Register GAP callback
+    ret = esp_ble_gap_register_callback(esp_gap_cb);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "GAP register failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    // Configure scan parameters
+    static esp_ble_scan_params_t ble_scan_params = {
+        .scan_type              = BLE_SCAN_TYPE_ACTIVE,
+        .own_addr_type          = BLE_ADDR_TYPE_PUBLIC,
+        .scan_filter_policy     = BLE_SCAN_FILTER_ALLOW_ALL,
+        .scan_interval          = 0x50,  // 50ms
+        .scan_window            = 0x30,  // 30ms
+        .scan_duplicate         = BLE_SCAN_DUPLICATE_DISABLE
+    };
+
+    esp_ble_gap_set_scan_params(&ble_scan_params);
+
+    // Start continuous scanning
+    esp_ble_gap_start_scanning(0);
+
+    ESP_LOGI(TAG, "BLE stack reinitialized and continuous scanning started");
 }
 
 // Timer callback to complete BLE scan and start WiFi
@@ -1093,6 +1151,11 @@ static void ap_monitor_task(void *param) {
     }
 
     ESP_LOGI(TAG, "WiFi AP stopped");
+
+    // Reinitialize BLE stack and resume continuous scanning
+    ESP_LOGI(TAG, "Resuming BLE scanning for tag detection...");
+    reinit_ble_stack();
+
     vTaskDelete(NULL);
 }
 
@@ -1222,42 +1285,6 @@ static void print_devices_task(void *param) {
             gpio_set_level(INTERNAL_LED_PIN, 0);
             wifi_ap_started = false;
             ble_scan_complete = false;  // Reset flag so we don't restart AP immediately
-
-            // Reinitialize BLE for continuous scanning
-            ESP_LOGI(TAG, "Restarting BLE scanning after AP shutdown");
-
-            esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-            esp_err_t ret = esp_bt_controller_init(&bt_cfg);
-            if (ret == ESP_OK) {
-                ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-                if (ret == ESP_OK) {
-                    ret = esp_bluedroid_init();
-                    if (ret == ESP_OK) {
-                        ret = esp_bluedroid_enable();
-                        if (ret == ESP_OK) {
-                            ret = esp_ble_gap_register_callback(esp_gap_cb);
-                            if (ret == ESP_OK) {
-                                static esp_ble_scan_params_t ble_scan_params = {
-                                    .scan_type              = BLE_SCAN_TYPE_ACTIVE,
-                                    .own_addr_type          = BLE_ADDR_TYPE_PUBLIC,
-                                    .scan_filter_policy     = BLE_SCAN_FILTER_ALLOW_ALL,
-                                    .scan_interval          = 0x50,
-                                    .scan_window            = 0x30,
-                                    .scan_duplicate         = BLE_SCAN_DUPLICATE_DISABLE
-                                };
-                                esp_ble_gap_set_scan_params(&ble_scan_params);
-                                esp_ble_gap_start_scanning(0);
-                                ESP_LOGI(TAG, "BLE scanning resumed");
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to restart BLE: %s", esp_err_to_name(ret));
-            }
-
             ESP_LOGI(TAG, "Resuming normal operation after AP shutdown");
         }
 
