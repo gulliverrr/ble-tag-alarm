@@ -14,6 +14,7 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -73,6 +74,15 @@ static TaskHandle_t dns_task_handle = NULL;  // DNS task handle
 #define RGB_LED_GREEN_PIN  GPIO_NUM_27  // RGB LED Green channel
 #define RGB_LED_BLUE_PIN   GPIO_NUM_32  // RGB LED Blue channel
 #define INTERNAL_LED_PIN   GPIO_NUM_2   // Internal LED for AP mode indication
+
+// PWM configuration for RGB LED
+#define LEDC_TIMER              LEDC_TIMER_0
+#define LEDC_MODE               LEDC_LOW_SPEED_MODE
+#define LEDC_RED_CHANNEL        LEDC_CHANNEL_0
+#define LEDC_GREEN_CHANNEL      LEDC_CHANNEL_1
+#define LEDC_BLUE_CHANNEL       LEDC_CHANNEL_2
+#define LEDC_DUTY_RES           LEDC_TIMER_8_BIT  // 8-bit resolution (0-255)
+#define LEDC_FREQUENCY          5000              // 5 kHz PWM frequency
 
 // Timing constants
 #define TAG_PRESENT_THRESHOLD_MS     60000              // Tag considered present if seen in last 60s
@@ -368,48 +378,103 @@ static void init_gpio(void) {
     gpio_set_level(GPIO_ALARM_RELAY, RELAY_OFF);  // Alarm OFF initially
     alarm_relay_state = false;
 
-    // Configure RGB LED pins
-    io_conf.pin_bit_mask = (1ULL << RGB_LED_RED_PIN) |
-                           (1ULL << RGB_LED_GREEN_PIN) |
-                           (1ULL << RGB_LED_BLUE_PIN) |
-                           (1ULL << INTERNAL_LED_PIN);
+    // Configure internal LED (simple GPIO, not PWM)
+    io_conf.pin_bit_mask = (1ULL << INTERNAL_LED_PIN);
     gpio_config(&io_conf);
     gpio_set_level(INTERNAL_LED_PIN, 0);  // Start off
 
-    ESP_LOGI(TAG, "GPIO initialized - Presence: %d, Charger: %d, Alarm: %d, RGB: R%d G%d B%d",
+    // Configure RGB LED PWM
+    // Prepare timer configuration
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_MODE,
+        .timer_num        = LEDC_TIMER,
+        .duty_resolution  = LEDC_DUTY_RES,
+        .freq_hz          = LEDC_FREQUENCY,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    // Prepare channel configuration for RED
+    ledc_channel_config_t ledc_channel_red = {
+        .speed_mode     = LEDC_MODE,
+        .channel        = LEDC_RED_CHANNEL,
+        .timer_sel      = LEDC_TIMER,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = RGB_LED_RED_PIN,
+        .duty           = 0,
+        .hpoint         = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_red));
+
+    // Prepare channel configuration for GREEN
+    ledc_channel_config_t ledc_channel_green = {
+        .speed_mode     = LEDC_MODE,
+        .channel        = LEDC_GREEN_CHANNEL,
+        .timer_sel      = LEDC_TIMER,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = RGB_LED_GREEN_PIN,
+        .duty           = 0,
+        .hpoint         = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_green));
+
+    // Prepare channel configuration for BLUE
+    ledc_channel_config_t ledc_channel_blue = {
+        .speed_mode     = LEDC_MODE,
+        .channel        = LEDC_BLUE_CHANNEL,
+        .timer_sel      = LEDC_TIMER,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = RGB_LED_BLUE_PIN,
+        .duty           = 0,
+        .hpoint         = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_blue));
+
+    ESP_LOGI(TAG, "GPIO initialized - Presence: %d, Charger: %d, Alarm: %d, RGB PWM: R%d G%d B%d",
              GPIO_PRESENCE_PIN, GPIO_CHARGER_RELAY, GPIO_ALARM_RELAY,
              RGB_LED_RED_PIN, RGB_LED_GREEN_PIN, RGB_LED_BLUE_PIN);
 }
 
-// Set RGB LED color
+// Set RGB LED color using PWM
 static void set_led_color(led_color_t color) {
+    uint32_t red_duty = 0, green_duty = 0, blue_duty = 0;
+
     switch (color) {
         case LED_OFF:
-            gpio_set_level(RGB_LED_RED_PIN, 0);
-            gpio_set_level(RGB_LED_GREEN_PIN, 0);
-            gpio_set_level(RGB_LED_BLUE_PIN, 0);
+            red_duty = 0;
+            green_duty = 0;
+            blue_duty = 0;
             break;
         case LED_GREEN:
-            gpio_set_level(RGB_LED_RED_PIN, 0);
-            gpio_set_level(RGB_LED_GREEN_PIN, 1);
-            gpio_set_level(RGB_LED_BLUE_PIN, 0);
+            red_duty = 0;
+            green_duty = 255;
+            blue_duty = 0;
             break;
         case LED_ORANGE:
-            gpio_set_level(RGB_LED_RED_PIN, 1);
-            gpio_set_level(RGB_LED_GREEN_PIN, 1);  // Red + Green = Orange
-            gpio_set_level(RGB_LED_BLUE_PIN, 0);
+            red_duty = 255;       // Full red
+            green_duty = 100;     // Reduced green for orange-yellow (was 255, too green)
+            blue_duty = 0;
             break;
         case LED_RED:
-            gpio_set_level(RGB_LED_RED_PIN, 1);
-            gpio_set_level(RGB_LED_GREEN_PIN, 0);
-            gpio_set_level(RGB_LED_BLUE_PIN, 0);
+            red_duty = 255;
+            green_duty = 0;
+            blue_duty = 0;
             break;
         case LED_BLUE:
-            gpio_set_level(RGB_LED_RED_PIN, 0);
-            gpio_set_level(RGB_LED_GREEN_PIN, 0);
-            gpio_set_level(RGB_LED_BLUE_PIN, 1);
+            red_duty = 0;
+            green_duty = 0;
+            blue_duty = 255;
             break;
     }
+
+    ledc_set_duty(LEDC_MODE, LEDC_RED_CHANNEL, red_duty);
+    ledc_update_duty(LEDC_MODE, LEDC_RED_CHANNEL);
+
+    ledc_set_duty(LEDC_MODE, LEDC_GREEN_CHANNEL, green_duty);
+    ledc_update_duty(LEDC_MODE, LEDC_GREEN_CHANNEL);
+
+    ledc_set_duty(LEDC_MODE, LEDC_BLUE_CHANNEL, blue_duty);
+    ledc_update_duty(LEDC_MODE, LEDC_BLUE_CHANNEL);
 }
 
 // Check if any registered tag is currently online
